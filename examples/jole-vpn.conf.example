@@ -1,0 +1,16 @@
+# Example answers file: jole-vpn-setup -y -c jole-vpn.conf
+PUBLIC_HOST=vpn.example.com
+PORT=1194
+PROTO=udp
+SUBNET=10.8.0.0/24
+DNS=1.1.1.1,9.9.9.9
+CIPHERS=AES-256-GCM:AES-128-GCM:AES-128-CBC
+CERT_TYPE=rsa2048          # ec | rsa2048 | rsa4096
+CERT_DAYS=825
+CRL_DAYS=180
+PASSWORD_AUTH=yes          # cert AND username/password
+PASSWORD_MATCH_CN=yes      # username must equal the cert name
+TLS_CRYPT=yes
+ROUTING=lan-only           # full | split | lan-only
+LAN_SUBNETS=192.168.1.0/24
+MSSFIX=1360

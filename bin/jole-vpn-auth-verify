@@ -1,0 +1,17 @@
+#!/bin/sh
+# OpenVPN auth-user-pass-verify script (via-file).
+# $1 = temp file: line1 username, line2 password.
+# users.db lines: username:<sha512-crypt hash from `openssl passwd -6`>
+# Also enforces username == certificate CN when MATCH_CN=yes in env.
+set -eu
+DB="${JOLE_DIR:-/etc/jole-vpn}/users.db"
+[ -r "$1" ] && [ -r "$DB" ] || exit 1
+user=$(sed -n 1p "$1"); pass=$(sed -n 2p "$1")
+case "$user" in ''|*[!A-Za-z0-9._-]*) exit 1;; esac
+if [ "${MATCH_CN:-no}" = "yes" ] && [ "${common_name:-}" != "$user" ]; then exit 1; fi
+hash=$(grep -m1 "^${user}:" "$DB" | cut -d: -f2-) || exit 1
+[ -n "$hash" ] || exit 1
+salt=$(printf '%s' "$hash" | cut -d'$' -f3)
+calc=$(printf '%s\n' "$pass" | openssl passwd -6 -salt "$salt" -stdin) || exit 1
+[ "$calc" = "$hash" ] && exit 0
+exit 1

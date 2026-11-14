@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Variables are assigned indirectly (printf -v / sourced config).
+# shellcheck disable=SC2034,SC2153
+# jole-vpn-setup: interactive / unattended OpenVPN server setup.
+# Every option: prompt, CLI flag, or config file (-c FILE). Precedence: flag > file > default.
+set -euo pipefail
+# shellcheck source=jole-vpn-lib.sh
+source "$(dirname "$(readlink -f "$0")")/jole-vpn-lib.sh"
+
+# ---- defaults (secure) ----
+D_PUBLIC_HOST=""; D_PORT=1194; D_PROTO=udp; D_SUBNET=10.8.0.0/24
+D_DNS="1.1.1.1,9.9.9.9"; D_CIPHERS="AES-256-GCM:AES-128-GCM:AES-128-CBC"
+D_CERT_TYPE=ec; D_CERT_DAYS=825; D_CRL_DAYS=180; D_PASSWORD_AUTH=yes
+D_PASSWORD_MATCH_CN=no; D_TLS_CRYPT=yes; D_ROUTING=full; D_LAN_SUBNETS=""
+D_MSSFIX=1360; D_SERVER_NAME=server
+
+usage() {
+  cat <<U
+Usage: jole-vpn-setup [options]
+  -c, --config FILE        load answers from FILE (jole-vpn.conf format)
+  -y, --yes                unattended: never prompt, use flags/file/defaults
+      --host HOST          public hostname / DDNS / IP clients connect to (required)
+      --port N             listen port (default $D_PORT)
+      --proto udp|tcp      transport (default $D_PROTO)
+      --subnet CIDR        VPN client subnet (default $D_SUBNET)
+      --dns LIST           comma-separated DNS servers pushed to clients (default $D_DNS)
+      --ciphers LIST       data-ciphers, colon-separated (default $D_CIPHERS)
+      --cert-type T        ec | rsa2048 | rsa4096 (default $D_CERT_TYPE)
+      --cert-days N        server/client cert lifetime (default $D_CERT_DAYS)
+      --crl-days N         CRL lifetime; regenerate before it expires (default $D_CRL_DAYS)
+      --password-auth y|n  require username/password IN ADDITION to cert (default $D_PASSWORD_AUTH)
+      --match-cn y|n       username must equal cert CN (default $D_PASSWORD_MATCH_CN)
+      --tls-crypt y|n      tls-crypt control channel (default $D_TLS_CRYPT)
+      --routing MODE       full | split | lan-only (default $D_ROUTING)
+      --lan LIST           comma-separated LAN CIDRs clients may reach, e.g. 192.168.1.0/24
+      --mssfix N           server mssfix (default $D_MSSFIX)
+      --force              overwrite existing PKI/config (DESTROYS the CA and all client certs)
+      --reconfigure        keep the existing CA/PKI and clients; rewrite jole-vpn.conf and
+                           server.conf only. Unset options keep their current values.
+                           (cert-type/cert-days changes apply to newly issued certs only)
+  -h, --help
+Routing modes:
+  full      all client traffic via VPN; internet + --lan subnets allowed
+  split     only --lan routes pushed; forwarding limited to --lan subnets
+  lan-only  only --lan routes pushed; firewall drops everything else (no internet)
+U
+}
+
+yn() { case "${1,,}" in y|yes|true|1) echo yes;; n|no|false|0) echo no;; *) die "expected yes/no, got '$1'";; esac; }
+
+UNATTENDED=no; FORCE=no; RECONFIGURE=no; CFG=""
+declare -A F=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--config) CFG="$2"; shift 2;;
+    -y|--yes) UNATTENDED=yes; shift;;
+    --host) F[PUBLIC_HOST]="$2"; shift 2;;
+    --port) F[PORT]="$2"; shift 2;;
+    --proto) F[PROTO]="$2"; shift 2;;
+    --subnet) F[SUBNET]="$2"; shift 2;;
+    --dns) F[DNS]="$2"; shift 2;;
+    --ciphers) F[CIPHERS]="$2"; shift 2;;
+    --cert-type) F[CERT_TYPE]="$2"; shift 2;;
+    --cert-days) F[CERT_DAYS]="$2"; shift 2;;
+    --crl-days) F[CRL_DAYS]="$2"; shift 2;;
+    --password-auth) F[PASSWORD_AUTH]="$(yn "$2")"; shift 2;;
+    --match-cn) F[PASSWORD_MATCH_CN]="$(yn "$2")"; shift 2;;
+    --tls-crypt) F[TLS_CRYPT]="$(yn "$2")"; shift 2;;
+    --routing) F[ROUTING]="$2"; shift 2;;
+    --lan) F[LAN_SUBNETS]="$2"; shift 2;;
+    --mssfix) F[MSSFIX]="$2"; shift 2;;
+    --force) FORCE=yes; shift;;
+    --reconfigure) RECONFIGURE=yes; shift;;
+    -h|--help) usage; exit 0;;
+    *) usage; die "unknown option: $1";;
+  esac
+done
+
+KEYS=(PUBLIC_HOST PORT PROTO SUBNET DNS CIPHERS CERT_TYPE CERT_DAYS CRL_DAYS PASSWORD_AUTH PASSWORD_MATCH_CN TLS_CRYPT ROUTING LAN_SUBNETS MSSFIX SERVER_NAME)
+for k in "${KEYS[@]}"; do d="D_$k"; printf -v "$k" '%s' "${!d}"; done
+if [[ "$RECONFIGURE" == yes ]]; then
+  [[ "$FORCE" != yes ]] || die "--reconfigure and --force are mutually exclusive"
+  [[ -f "$PKI_DIR/ca.crt" ]] || die "--reconfigure needs an existing PKI (run setup first)"
+  [[ -f "$CONF_FILE" ]] || die "--reconfigure needs an existing $CONF_FILE"
+  # current values are the defaults; -c FILE and flags still override them
+  # shellcheck source=/dev/null
+  source "$CONF_FILE"
+fi
+if [[ -n "$CFG" ]]; then [[ -f "$CFG" ]] || die "no such config: $CFG"; # shellcheck source=/dev/null
+  source "$CFG"; fi
+for k in "${!F[@]}"; do printf -v "$k" '%s' "${F[$k]}"; done
+
+ask() { # ask VAR "Question"
+  local var="$1" q="$2" cur="${!1}" ans
+  [[ "$UNATTENDED" == yes || -n "${F[$var]+x}" ]] && return 0
+  read -r -p "$q [${cur}]: " ans || true
+  [[ -n "$ans" ]] && printf -v "$var" '%s' "$ans"
+  return 0
+}
+
+if [[ "$UNATTENDED" != yes ]]; then
+  echo "== jole-vpn setup (Enter keeps the [default]) =="
+fi
+ask PUBLIC_HOST "Public hostname / DDNS / IP"
+ask PORT "Port"
+ask PROTO "Protocol (udp/tcp)"
+ask SUBNET "VPN subnet"
+ask DNS "DNS servers (comma-separated)"
+ask CIPHERS "data-ciphers (colon-separated)"
+ask CERT_TYPE "Cert type (ec/rsa2048/rsa4096)"
+ask CERT_DAYS "Cert lifetime days"
+ask CRL_DAYS "CRL lifetime days"
+ask PASSWORD_AUTH "Require username/password + cert (yes/no)"
+ask TLS_CRYPT "Enable tls-crypt (yes/no)"
+ask ROUTING "Routing mode (full/split/lan-only)"
+ask LAN_SUBNETS "LAN subnets clients may reach (comma-separated, blank=none)"
+
+# ---- validate ----
+PASSWORD_AUTH=$(yn "$PASSWORD_AUTH"); TLS_CRYPT=$(yn "$TLS_CRYPT"); PASSWORD_MATCH_CN=$(yn "$PASSWORD_MATCH_CN")
+[[ -n "$PUBLIC_HOST" ]] || die "--host is required"
+[[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || die "bad host: $PUBLIC_HOST"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT<1 || PORT>65535 )); then die "bad port"; fi
+[[ "$PROTO" == udp || "$PROTO" == tcp ]] || die "proto must be udp or tcp"
+cidr_re='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+[[ "$SUBNET" =~ $cidr_re ]] || die "bad subnet"
+IFS=',' read -r -a _lan <<< "$LAN_SUBNETS"
+for c in "${_lan[@]}"; do [[ -z "$c" || "$c" =~ $cidr_re ]] || die "bad LAN CIDR: $c"; done
+case "$CERT_TYPE" in ec|rsa2048|rsa4096) ;; *) die "bad cert type";; esac
+case "$ROUTING" in full|split|lan-only) ;; *) die "bad routing mode";; esac
+[[ "$ROUTING" == full || -n "$LAN_SUBNETS" ]] || die "routing '$ROUTING' needs --lan"
+[[ "$CIPHERS" =~ ^[A-Za-z0-9:-]+$ ]] || die "bad cipher list"
+[[ "$CERT_DAYS" =~ ^[0-9]+$ && "$CRL_DAYS" =~ ^[0-9]+$ && "$MSSFIX" =~ ^[0-9]+$ ]] || die "days/mssfix must be numbers"
+
+if [[ -d "$PKI_DIR" && "$FORCE" != yes && "$RECONFIGURE" != yes ]]; then
+  die "PKI exists at $PKI_DIR (use --reconfigure to change settings, or --force to rebuild)"
+fi
+
+umask 077
+mkdir -p "$JOLE_DIR" "$CLIENT_DIR"
+{ echo "# jole-vpn.conf (generated $(date -u +%FT%TZ))"
+  for k in "${KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done; } > "$CONF_FILE"
+
+# ---- PKI ----
+VARS="$PKI_DIR/vars"
+write_vars() {
+{ echo "set_var EASYRSA_DIGEST sha256"
+  echo "set_var EASYRSA_CERT_EXPIRE $CERT_DAYS"
+  echo "set_var EASYRSA_CRL_DAYS $CRL_DAYS"
+  echo "set_var EASYRSA_CA_EXPIRE 3650"
+  case "$CERT_TYPE" in
+    ec) echo "set_var EASYRSA_ALGO ec"; echo "set_var EASYRSA_CURVE prime256v1";;
+    rsa2048) echo "set_var EASYRSA_ALGO rsa"; echo "set_var EASYRSA_KEY_SIZE 2048";;
+    rsa4096) echo "set_var EASYRSA_ALGO rsa"; echo "set_var EASYRSA_KEY_SIZE 4096";;
+  esac; } > "$VARS"
+}
+gen_tc_key() {
+  if command -v openvpn >/dev/null; then openvpn --genkey secret "$TC_KEY"
+  else { echo "-----BEGIN OpenVPN Static key V1-----"; openssl rand -hex 256 | fold -w32; echo "-----END OpenVPN Static key V1-----"; } > "$TC_KEY"; fi
+}
+if [[ "$RECONFIGURE" == yes ]]; then
+  info "reconfigure: keeping existing CA, server cert and clients"
+  write_vars
+  if [[ "$TLS_CRYPT" == yes && ! -f "$TC_KEY" ]]; then
+    gen_tc_key; info "new tls-crypt key generated: re-download ALL client profiles"
+  fi
+else
+  rm -rf "$PKI_DIR"
+  easyrsa init-pki >/dev/null
+  write_vars
+  info "building CA and server cert ($CERT_TYPE)..."
+  EASYRSA_REQ_CN="jole-vpn-ca" easyrsa --vars="$VARS" build-ca nopass >/dev/null 2>&1 || die "build-ca failed"
+  easyrsa --vars="$VARS" build-server-full "$SERVER_NAME" nopass >/dev/null 2>&1 || die "server cert failed"
+  easyrsa --vars="$VARS" gen-crl >/dev/null 2>&1 || die "gen-crl failed"
+  [[ "$TLS_CRYPT" == yes ]] && gen_tc_key
+fi
+if [[ "$PASSWORD_AUTH" == yes && ! -f "$USERS_DB" ]]; then touch "$USERS_DB"; fi
+
+gen_server_conf() {
+  local net mask
+  read -r net mask <<< "$(cidr_to_netmask "$SUBNET")"
+  cat <<C
+# Generated by jole-vpn-setup. Regenerate rather than hand-edit.
+port $PORT
+proto ${PROTO}4
+dev tun
+topology subnet
+server $net $mask
+ca $PKI_DIR/ca.crt
+cert $PKI_DIR/issued/$SERVER_NAME.crt
+key $PKI_DIR/private/$SERVER_NAME.key
+dh none
+crl-verify $PKI_DIR/crl.pem
+verify-client-cert require
+remote-cert-tls client
+tls-version-min 1.2
+data-ciphers $CIPHERS
+data-ciphers-fallback AES-128-CBC
+auth SHA256
+keepalive 10 60
+mssfix $MSSFIX
+persist-key
+persist-tun
+user nobody
+group nogroup
+status /tmp/openvpn-status.log 10
+verb 3
+C
+  [[ "$PROTO" == udp ]] && echo "explicit-exit-notify 1"
+  [[ "$TLS_CRYPT" == yes ]] && echo "tls-crypt $TC_KEY"
+  if [[ "$PASSWORD_AUTH" == yes ]]; then
+    echo "script-security 2"
+    echo "setenv JOLE_DIR $JOLE_DIR"
+    echo "setenv MATCH_CN $PASSWORD_MATCH_CN"
+    echo "auth-user-pass-verify /usr/local/bin/jole-vpn-auth-verify via-file"
+    echo "auth-nocache"
+  fi
+  local d c n m
+  IFS=',' read -r -a dns <<< "$DNS"
+  for d in "${dns[@]}"; do [[ -n "$d" ]] && echo "push \"dhcp-option DNS $d\""; done
+  [[ "$ROUTING" == full ]] && echo 'push "redirect-gateway def1 bypass-dhcp"'
+  for c in "${_lan[@]}"; do
+    [[ -z "$c" ]] && continue
+    read -r n m <<< "$(cidr_to_netmask "$c")"; echo "push \"route $n $m\""
+  done
+}
+gen_server_conf > "$SERVER_CONF"
+
+fix_perms
+info "done. Config: $CONF_FILE  Server: $SERVER_CONF"
+info "compose port line should be: ${PORT}:${PORT}/${PROTO}  (set JOLE_VPN_PORT/JOLE_VPN_PROTO)"
+info "next: jole-vpn-client add <name> [--profile mobile|m2000]"

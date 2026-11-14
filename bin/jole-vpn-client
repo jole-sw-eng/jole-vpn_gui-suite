@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# jole-vpn-client: manage client certs, passwords and .ovpn profiles.
+set -euo pipefail
+# shellcheck source=jole-vpn-lib.sh
+source "$(dirname "$(readlink -f "$0")")/jole-vpn-lib.sh"
+
+usage() {
+  cat <<U
+Usage: jole-vpn-client <command> [args]
+  add <name> [--profile mobile|m2000] [--password PW | --password-stdin | --no-password]
+        create cert (+ password user if password auth is on) and write clients/<name>.ovpn
+        If password auth is on and no --password is given, you are prompted;
+        with JOLE_NONINTERACTIVE=1 a random 24-char password is generated and printed once.
+  profile <name> [--profile mobile|m2000]   (re)generate the .ovpn for an existing client
+  passwd <name> [--password PW | --password-stdin]   set/replace the password
+        --password-stdin reads the password from the first line of stdin
+        (keeps it out of the process list; used by the web UI)
+  revoke <name>                            revoke cert, refresh CRL, remove password + profile
+  list                                     list clients and status
+  show <name>                              print the .ovpn to stdout
+  gen-crl                                  refresh CRL (do this before CRL_DAYS runs out)
+Profiles:
+  mobile  udp4, tun-mtu 1500, mssfix 1360, keepalive-friendly, GCM preferred (phones/laptops)
+  m2000   minimal directives for Inseego M2000 / OpenVPN 2.4 legacy clients:
+          cipher AES-128-CBC + data-ciphers incl. GCM, auth SHA256, auth-user-pass
+U
+}
+
+set_password() { # name pw
+  local name="$1" pw="$2" h tmp
+  [[ ${#pw} -ge 12 ]] || die "password must be at least 12 characters"
+  h=$(printf '%s\n' "$pw" | openssl passwd -6 -stdin)
+  tmp=$(mktemp "$JOLE_DIR/.users.XXXXXX")
+  { if [[ -f "$USERS_DB" ]]; then grep -v "^${name}:" "$USERS_DB" || true; fi; echo "${name}:${h}"; } > "$tmp"
+  mv "$tmp" "$USERS_DB"; fix_perms
+}
+
+prompt_password() {
+  local p1 p2
+  if [[ "${JOLE_NONINTERACTIVE:-0}" == 1 || ! -t 0 ]]; then
+    p1=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 24)
+    echo "Generated password for $1 (shown once): $p1" >&2
+    printf '%s' "$p1"; return
+  fi
+  read -r -s -p "Password for $1 (min 12): " p1; echo >&2
+  read -r -s -p "Repeat: " p2; echo >&2
+  [[ "$p1" == "$p2" ]] || die "passwords do not match"
+  printf '%s' "$p1"
+}
+
+inline() { echo "<$1>"; cat "$2"; echo "</$1>"; }
+
+cert_body() { sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$1"; }
+
+write_profile() { # name profile
+  local name="$1" prof="$2" out
+  out="$CLIENT_DIR/$name.ovpn"
+  [[ -f "$PKI_DIR/issued/$name.crt" ]] || die "no cert for $name"
+  umask 077; mkdir -p "$CLIENT_DIR"
+  {
+    echo "# jole-vpn client: $name (profile: $prof)"
+    echo "client"
+    echo "dev tun"
+    echo "proto ${PROTO}4"
+    echo "remote $PUBLIC_HOST $PORT"
+    echo "resolv-retry infinite"
+    echo "nobind"
+    echo "remote-cert-tls server"
+    echo "auth SHA256"
+    case "$prof" in
+      mobile)
+        echo "data-ciphers $CIPHERS"
+        echo "tls-version-min 1.2"
+        echo "tun-mtu 1500"
+        echo "mssfix 1360"
+        echo "keepalive 10 60"
+        echo "persist-key"
+        echo "persist-tun"
+        echo "verb 3"
+        ;;
+      m2000)
+        # Keep to directives OpenVPN 2.4.3 accepts. No nice/mute/compress/scripts.
+        echo "cipher AES-128-CBC"
+        echo "ncp-ciphers AES-128-GCM:AES-256-GCM:AES-128-CBC"
+        echo "tls-version-min 1.2"
+        echo "mssfix 1360"
+        echo "persist-key"
+        echo "persist-tun"
+        echo "verb 3"
+        ;;
+      *) die "unknown profile: $prof";;
+    esac
+    [[ "$PASSWORD_AUTH" == yes ]] && echo "auth-user-pass"
+    inline ca "$PKI_DIR/ca.crt"
+    echo "<cert>"; cert_body "$PKI_DIR/issued/$name.crt"; echo "</cert>"
+    inline key "$PKI_DIR/private/$name.key"
+    [[ "$TLS_CRYPT" == yes ]] && inline tls-crypt "$TC_KEY"
+    true
+  } > "$out"
+  # Defense in depth: profiles must never carry script hooks.
+  if grep -Eq '^[[:space:]]*(script-security|up|down|route-up|route-pre-down|ipchange|tls-verify|learn-address|client-connect|client-disconnect|auth-user-pass-verify|plugin|nice|mute|comp-lzo|compress)([[:space:]]|$)' "$out"; then
+    rm -f "$out"; die "refusing to write profile with forbidden directive"
+  fi
+  echo "$out"
+}
+
+parse_opts() {
+  PROFILE=mobile; PW=""; NOPW=no
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) PROFILE="$2"; shift 2;;
+      --password) PW="$2"; shift 2;;
+      --no-password) NOPW=yes; shift;;
+      --password-stdin) IFS= read -r PW || true; [[ -n "$PW" ]] || die "no password on stdin"; shift;;
+      *) die "unknown option: $1";;
+    esac
+  done
+  [[ "$PROFILE" == legacy ]] && PROFILE=m2000
+  case "$PROFILE" in mobile|m2000) ;; *) die "profile must be mobile or m2000";; esac
+}
+
+cmd="${1:-}"; shift || true
+[[ -z "$cmd" || "$cmd" == -h || "$cmd" == --help || "$cmd" == help ]] && { usage; exit 0; }
+load_conf
+VARS="$PKI_DIR/vars"
+
+case "$cmd" in
+  add)
+    name="${1:-}"; shift || true; valid_name "$name" || die "invalid name"
+    [[ "$name" != "$SERVER_NAME" ]] || die "name reserved"
+    parse_opts "$@"
+    [[ -f "$PKI_DIR/issued/$name.crt" ]] && die "client $name exists (revoke first, or use 'profile')"
+    easyrsa --vars="$VARS" build-client-full "$name" nopass >/dev/null 2>&1 || die "cert creation failed"
+    if [[ "$PASSWORD_AUTH" == yes && "$NOPW" != yes ]]; then
+      [[ -n "$PW" ]] || PW=$(prompt_password "$name")
+      set_password "$name" "$PW"
+    fi
+    write_profile "$name" "$PROFILE"
+    ;;
+  profile)
+    name="${1:-}"; shift || true; valid_name "$name" || die "invalid name"
+    parse_opts "$@"; write_profile "$name" "$PROFILE";;
+  passwd)
+    name="${1:-}"; shift || true; valid_name "$name" || die "invalid name"
+    parse_opts "$@"; [[ -n "$PW" ]] || PW=$(prompt_password "$name"); set_password "$name" "$PW"; info "password updated";;
+  revoke)
+    name="${1:-}"; valid_name "$name" || die "invalid name"
+    [[ "$name" != "$SERVER_NAME" ]] || die "refusing to revoke server cert"
+    easyrsa --vars="$VARS" revoke "$name" >/dev/null 2>&1 || die "revoke failed"
+    easyrsa --vars="$VARS" gen-crl >/dev/null 2>&1 || die "gen-crl failed"
+    if [[ -f "$USERS_DB" ]]; then tmp=$(mktemp "$JOLE_DIR/.users.XXXXXX"); grep -v "^${name}:" "$USERS_DB" > "$tmp" || true; mv "$tmp" "$USERS_DB"; fi
+    rm -f "$CLIENT_DIR/$name.ovpn"; fix_perms
+    info "revoked $name; CRL refreshed (OpenVPN re-reads it on each new connection)";;
+  list)
+    printf '%-24s %-8s %-10s %s\n' NAME STATUS PASSWORD EXPIRES
+    while IFS='|' read -r st exp dn; do
+      cn="${dn##*CN=}"; cn="${cn%%/*}"
+      [[ "$cn" == "$SERVER_NAME" ]] && continue
+      case "$st" in V) s=valid;; R) s=revoked;; E) s=expired;; *) s="$st";; esac
+      pw=no; [[ -f "$USERS_DB" ]] && grep -q "^${cn}:" "$USERS_DB" && pw=yes
+      printf '%-24s %-8s %-10s 20%s-%s-%s\n' "$cn" "$s" "$pw" "${exp:0:2}" "${exp:2:2}" "${exp:4:2}"
+    done < <(awk -F'\t' '{print $1"|"$2"|"$6}' "$PKI_DIR/index.txt");;
+  show)
+    name="${1:-}"; valid_name "$name" || die "invalid name"; cat "$CLIENT_DIR/$name.ovpn";;
+  gen-crl)
+    easyrsa --vars="$VARS" gen-crl >/dev/null 2>&1 || die "gen-crl failed"; fix_perms; info "CRL refreshed";;
+  *) usage; exit 1;;
+esac

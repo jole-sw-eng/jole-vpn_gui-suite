@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# jole-vpn-web: LAN-only HTTPS admin UI. Usage: jole-vpn-web [serve|hash-password|reset-admin]
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+lib=/usr/local/lib/jole-vpn
+[[ -d "$here/../web/jolevpn_web" ]] && lib="$here/../web"
+export JOLE_BIN_DIR="${JOLE_BIN_DIR:-$here}"
+export PYTHONPATH="$lib${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m jolevpn_web "$@"

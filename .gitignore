@@ -1,0 +1,20 @@
+# Never commit PKI, keys, user DBs, generated profiles or local configs
+pki/
+data/
+*.key
+*.crt
+*.pem
+*.p12
+*.csr
+*.ovpn
+users.db
+ta.key
+tc.key
+jole-vpn.conf
+!examples/jole-vpn.conf.example
+.env
+__pycache__/
+*.pyc
+web/data/
+audit.log
+admin.json

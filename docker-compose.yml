@@ -1,0 +1,40 @@
+services:
+  jole-vpn:
+    build: .
+    image: jole-vpn:2.0
+    container_name: jole-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      # Admin web UI (v2). Set JOLE_WEB=0 in .env to run CLI-only exactly like v1.
+      JOLE_WEB: "${JOLE_WEB:-1}"
+      # The host LAN address the UI is published on (e.g. 192.168.1.10). Defaults to
+      # loopback, never all interfaces; the UI refuses to start if this is 0.0.0.0.
+      WEB_BIND: "${WEB_BIND:-127.0.0.1}"
+      WEB_PORT: "${WEB_PORT:-8443}"
+      # Inside the container only; docker publishes it solely on WEB_BIND (below).
+      WEB_LISTEN: "0.0.0.0"
+      # Optional: comma-separated source CIDRs allowed to use the UI, e.g. 192.168.1.0/24
+      WEB_ALLOW_CIDRS: "${WEB_ALLOW_CIDRS:-}"
+      # VPN clients are blocked from the UI unless this is yes.
+      WEB_ALLOW_VPN: "${WEB_ALLOW_VPN:-no}"
+      # Optional extra hostnames for the UI (DNS-rebinding guard + cert SAN), e.g. vpnadmin.lan
+      WEB_HOSTNAMES: "${WEB_HOSTNAMES:-}"
+      # Optional: pre-set admin (hash from `docker compose run --rm jole-vpn web hash-password`)
+      JOLE_WEB_ADMIN_USER: "${JOLE_WEB_ADMIN_USER:-admin}"
+      JOLE_WEB_ADMIN_HASH: "${JOLE_WEB_ADMIN_HASH:-}"
+    ports:
+      # VPN: the only port your router forwards. Must match PORT/PROTO in jole-vpn.conf.
+      - "${JOLE_VPN_PORT:-1194}:${JOLE_VPN_PORT:-1194}/${JOLE_VPN_PROTO:-udp}"
+      # Admin UI: LAN address only. NEVER port-forward this on the router.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8443}:8443/tcp"
+    volumes:
+      - jole-vpn-data:/etc/jole-vpn
+
+volumes:
+  jole-vpn-data:
